@@ -117,12 +117,12 @@ Full EDA notebook in R covering:
 **To render:**
 ```bash
 # From terminal inside the project folder
-Rscript -e "rmarkdown::render('Ship_EDA.Rmd', output_format='html_document')"
+Rscript -e "rmarkdown::render('EDA/Ship_EDA.Rmd', output_format='html_document')"
 
-# Or in RStudio: open Ship_EDA.Rmd and click Knit (Cmd+Shift+K)
+# Or in RStudio: open EDA/Ship_EDA.Rmd and click Knit (Cmd+Shift+K)
 
 # Or open the already-rendered file
-open Ship_EDA.html
+open EDA/Ship_EDA.html
 ```
 
 **Required R packages:**
@@ -189,13 +189,13 @@ prop.table(table(df$Maintenance_Status))
 
 ## 6. Clustering Implementation
 
-### File: `Ship_Clustering.Rmd` → `Ship_Clustering.html`
+### File: `clustering/Ship_Clustering.Rmd` → `clustering/Ship_Clustering.html`
 
 **To render:**
 ```bash
-Rscript -e "rmarkdown::render('Ship_Clustering.Rmd', output_format='html_document')"
+Rscript -e "rmarkdown::render('clustering/Ship_Clustering.Rmd', output_format='html_document')"
 # Or open the already-rendered file
-open Ship_Clustering.html
+open clustering/Ship_Clustering.html
 ```
 
 **Required R packages:**
@@ -316,7 +316,7 @@ ggsave("my_plot.png", plot = last_plot(), width = 10, height = 6, dpi = 300)
 
 ## 9. Next Step
 
-Build the classifier notebook — `Ship_Classifier.Rmd`:
+Build the classifier notebook — `classification/Ship_Classifier.Rmd`:
 - Target: `Maintenance_Status` (Good / Fair / Critical)
 - Check class balance → apply SMOTE if Critical < 10%
 - Algorithms: Random Forest, XGBoost, Multinomial Logistic Regression, KNN

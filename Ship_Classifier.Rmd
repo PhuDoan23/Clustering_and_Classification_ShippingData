@@ -1,0 +1,741 @@
+---
+title: "Predicting Ship Fuel Efficiency Class: A Machine Learning Classification Approach"
+author: "Shipping Performance Analysis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+
+---
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(ranger)
+library(gbm)
+library(nnet)
+library(kknn)
+library(pROC)
+library(MLmetrics)
+library(knitr)
+library(kableExtra)
+library(scales)
+library(viridis)
+library(gridExtra)
+library(RColorBrewer)
+```
+
+---
+
+# 1. Problem Statement
+
+**Objective:** Predict a voyage's **fuel efficiency class** (Low / Medium / High) from
+its operational and vessel characteristics — a 3-class classification problem.
+
+**Why this target?**
+Diagnostic testing confirmed that `Maintenance_Status` was randomly assigned in this
+synthetic dataset (ANOVA F < 2.0 across all features). `Efficiency_nm_per_kWh` is a
+real measured outcome that operational features such as speed, engine power, cargo load,
+and route type can logically influence.
+
+**Target variable:** `Efficiency_Class` — derived by binning `Efficiency_nm_per_kWh`
+into equal thirds:
+
+| Class | Efficiency Range | Meaning |
+|-------|-----------------|---------|
+| `Low`    | Bottom 33% | Poor fuel economy — high operating cost per nm |
+| `Medium` | Middle 33%  | Average fuel economy |
+| `High`   | Top 33%     | Excellent fuel economy — low cost per nm |
+
+> `Efficiency_nm_per_kWh` is **excluded from the feature set** — it is the source
+> of the target and would cause data leakage if included.
+
+**Business value:** Predicting efficiency class before departure allows operators to
+adjust speed, load, and routing to target the High class and reduce fuel costs.
+
+---
+
+# 2. Data Loading & Preprocessing
+
+## 2.1 Load Data
+
+```{r load}
+df <- read.csv("Ship_Performance_Dataset.csv", stringsAsFactors = FALSE)
+df$Date <- as.Date(df$Date)
+
+cat("Dimensions:", nrow(df), "rows ×", ncol(df), "cols\n")
+```
+
+## 2.2 Create Target — Efficiency_Class
+
+```{r create-target}
+df <- df %>%
+  mutate(
+    Efficiency_Class = factor(
+      ntile(Efficiency_nm_per_kWh, 3),
+      levels = c(1, 2, 3),
+      labels = c("Low", "Medium", "High")
+    )
+  )
+
+cat("Efficiency_Class distribution:\n")
+print(table(df$Efficiency_Class))
+cat("\nProportions (%):\n")
+print(round(prop.table(table(df$Efficiency_Class)) * 100, 1))
+```
+
+```{r eff-dist-plot, fig.height=4}
+# Efficiency distribution coloured by class
+ggplot(df, aes(x = Efficiency_nm_per_kWh, fill = Efficiency_Class)) +
+  geom_histogram(bins = 50, color = "white", alpha = 0.9) +
+  scale_fill_manual(values = c("Low" = "#e74c3c", "Medium" = "#f39c12", "High" = "#2ecc71")) +
+  labs(title = "Efficiency_nm_per_kWh Distribution — Coloured by Derived Class",
+       subtitle = "Three equal-frequency bins (ntile = 3)",
+       x = "Efficiency (nm/kWh)", y = "Count", fill = "Efficiency Class") +
+  theme_minimal(base_size = 13)
+```
+
+```{r class-dist-plot, fig.height=4}
+class_df <- as.data.frame(table(df$Efficiency_Class)) %>%
+  rename(Class = Var1, Count = Freq) %>%
+  mutate(Pct = round(Count / sum(Count) * 100, 1))
+
+ggplot(class_df, aes(x = Class, y = Count, fill = Class)) +
+  geom_col(color = "white", width = 0.65) +
+  geom_text(aes(label = paste0(Count, "\n(", Pct, "%)")),
+            vjust = -0.3, fontface = "bold", size = 4) +
+  scale_fill_manual(values = c("Low" = "#e74c3c", "Medium" = "#f39c12", "High" = "#2ecc71")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Target Class Distribution — Efficiency Class",
+       subtitle = "Perfectly balanced by construction (ntile) — No SMOTE required",
+       x = "Efficiency Class", y = "Count") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+## 2.3 Feature-Target Relationship Check
+
+Before modelling, verify that features have real signal for this target using ANOVA F-statistics.
+
+```{r signal-check, fig.height=5}
+num_cols <- c("Speed_Over_Ground_knots", "Engine_Power_kW", "Distance_Traveled_nm",
+              "Draft_meters", "Cargo_Weight_tons", "Operational_Cost_USD",
+              "Revenue_per_Voyage_USD", "Turnaround_Time_hours",
+              "Seasonal_Impact_Score", "Weekly_Voyage_Count", "Average_Load_Percentage")
+
+fstats <- sapply(num_cols, function(col) {
+  m <- aov(as.formula(paste(col, "~ Efficiency_Class")), data = df)
+  summary(m)[[1]][["F value"]][1]
+})
+
+fstat_df <- data.frame(
+  Feature   = num_cols,
+  F_Stat    = round(fstats, 2),
+  Signal    = ifelse(fstats > 10, "Strong", ifelse(fstats > 3, "Moderate", "Weak"))
+)
+
+ggplot(fstat_df, aes(x = reorder(Feature, F_Stat), y = F_Stat, fill = Signal)) +
+  geom_col(color = "white", width = 0.7) +
+  geom_hline(yintercept = 3,  linetype = "dashed", color = "#e74c3c",  linewidth = 0.8) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "#27ae60", linewidth = 0.8) +
+  annotate("text", x = 1.5, y = 4,  label = "Moderate threshold (F=3)",  color = "#e74c3c",  size = 3.5) +
+  annotate("text", x = 1.5, y = 11, label = "Strong threshold (F=10)",   color = "#27ae60", size = 3.5) +
+  scale_fill_manual(values = c("Strong" = "#2ecc71", "Moderate" = "#f39c12", "Weak" = "#e74c3c")) +
+  coord_flip() +
+  labs(title = "ANOVA F-Statistics — Feature Signal Strength for Efficiency_Class",
+       subtitle = "Higher F = stronger relationship between feature and target",
+       x = NULL, y = "F-Statistic", fill = "Signal") +
+  theme_minimal(base_size = 12)
+
+kable(fstat_df[order(-fstat_df$F_Stat), ],
+      caption = "Feature Signal Strength (ANOVA F-Stat vs Efficiency_Class)",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  column_spec(3, bold = TRUE,
+              color = ifelse(fstat_df[order(-fstat_df$F_Stat),]$Signal == "Strong", "darkgreen",
+                      ifelse(fstat_df[order(-fstat_df$F_Stat),]$Signal == "Moderate", "darkorange", "red")))
+```
+
+## 2.4 Build Feature Matrix
+
+```{r preprocess}
+# Drop Date, Efficiency_nm_per_kWh (source of target = data leakage)
+df_model <- df %>%
+  select(-Date, -Efficiency_nm_per_kWh, -Maintenance_Status) %>%
+  mutate(
+    Ship_Type         = factor(Ship_Type),
+    Route_Type        = factor(Route_Type),
+    Engine_Type       = factor(Engine_Type),
+    Weather_Condition = factor(Weather_Condition)
+  ) %>%
+  drop_na()
+
+cat("Model dataset:", nrow(df_model), "rows ×", ncol(df_model), "cols\n")
+cat("Target distribution:\n")
+print(table(df_model$Efficiency_Class))
+```
+
+```{r feature-list}
+feature_cols <- setdiff(names(df_model), "Efficiency_Class")
+cat("Features (", length(feature_cols), "):\n")
+cat(paste(" •", feature_cols, collapse = "\n"), "\n")
+```
+
+---
+
+# 3. Train / Test Split
+
+**Strategy:** Stratified 80/20 split — preserves class proportions in both sets.
+
+```{r split}
+set.seed(42)
+train_idx <- createDataPartition(df_model$Efficiency_Class, p = 0.80, list = FALSE)
+
+train_df <- df_model[ train_idx, ]
+test_df  <- df_model[-train_idx, ]
+
+cat("Training set:", nrow(train_df), "rows\n")
+cat("Test set:    ", nrow(test_df),  "rows\n\n")
+
+cat("Train class balance:\n")
+print(round(prop.table(table(train_df$Efficiency_Class)) * 100, 1))
+cat("\nTest class balance:\n")
+print(round(prop.table(table(test_df$Efficiency_Class)) * 100, 1))
+```
+
+---
+
+# 4. Cross-Validation Setup
+
+**Strategy:** 5-fold stratified cross-validation on the training set.
+All models share the same CV folds for a fair comparison.
+
+```{r cv-setup}
+cv_ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = multiClassSummary,
+  savePredictions = "final",
+  verboseIter     = FALSE
+)
+
+cat("CV: 5-fold stratified | Metric: Accuracy + Macro F1\n")
+cat("Baseline (random chance): 33.3%\n")
+```
+
+---
+
+# 5. Algorithm 1 — Multinomial Logistic Regression
+
+**Baseline model.** Linear decision boundaries via softmax function.
+
+```{r lr-train}
+set.seed(42)
+lr_model <- train(
+  Efficiency_Class ~ .,
+  data       = train_df,
+  method     = "multinom",
+  trControl  = cv_ctrl,
+  preProcess = c("center", "scale"),
+  trace      = FALSE
+)
+
+cat("Logistic Regression — Best CV Accuracy:",
+    round(max(lr_model$results$Accuracy), 4), "\n")
+```
+
+```{r lr-predict}
+lr_pred  <- predict(lr_model, test_df)
+lr_probs <- predict(lr_model, test_df, type = "prob")
+
+lr_cm <- confusionMatrix(lr_pred, test_df$Efficiency_Class)
+cat("=== Logistic Regression — Test Set ===\n")
+print(lr_cm$overall[c("Accuracy", "Kappa")])
+cat("\nPer-class metrics:\n")
+print(round(lr_cm$byClass[, c("Precision", "Recall", "F1")], 4))
+```
+
+---
+
+# 6. Algorithm 2 — K-Nearest Neighbours (KNN)
+
+**Instance-based learner.** Classifies by majority vote among K nearest neighbours.
+
+```{r knn-train}
+set.seed(42)
+knn_model <- train(
+  Efficiency_Class ~ .,
+  data       = train_df,
+  method     = "kknn",
+  trControl  = cv_ctrl,
+  preProcess = c("center", "scale"),
+  tuneGrid   = expand.grid(
+    kmax     = c(5, 7, 9, 11, 15),
+    distance = 2,
+    kernel   = "optimal"
+  )
+)
+
+cat("KNN — Best K:", knn_model$bestTune$kmax, "\n")
+cat("KNN — Best CV Accuracy:", round(max(knn_model$results$Accuracy), 4), "\n")
+```
+
+```{r knn-tune-plot, fig.height=4}
+plot(knn_model, main = "KNN — Accuracy vs K (5-fold CV)")
+```
+
+```{r knn-predict}
+knn_pred  <- predict(knn_model, test_df)
+knn_probs <- predict(knn_model, test_df, type = "prob")
+
+knn_cm <- confusionMatrix(knn_pred, test_df$Efficiency_Class)
+cat("=== KNN — Test Set ===\n")
+print(knn_cm$overall[c("Accuracy", "Kappa")])
+cat("\nPer-class metrics:\n")
+print(round(knn_cm$byClass[, c("Precision", "Recall", "F1")], 4))
+```
+
+---
+
+# 7. Algorithm 3 — Random Forest
+
+**Ensemble of decision trees** using bootstrap aggregation + random feature subsets.
+
+```{r rf-train}
+set.seed(42)
+rf_model <- train(
+  Efficiency_Class ~ .,
+  data       = train_df,
+  method     = "ranger",
+  trControl  = cv_ctrl,
+  preProcess = c("center", "scale"),
+  importance = "impurity",
+  tuneGrid   = expand.grid(
+    mtry          = c(3, 5, 7, 9),
+    splitrule     = "gini",
+    min.node.size = c(1, 5)
+  )
+)
+
+cat("Random Forest — Best mtry:", rf_model$bestTune$mtry, "\n")
+cat("Random Forest — Best min.node.size:", rf_model$bestTune$min.node.size, "\n")
+cat("Random Forest — Best CV Accuracy:", round(max(rf_model$results$Accuracy), 4), "\n")
+```
+
+```{r rf-predict}
+rf_pred  <- predict(rf_model, test_df)
+rf_probs <- predict(rf_model, test_df, type = "prob")
+
+rf_cm <- confusionMatrix(rf_pred, test_df$Efficiency_Class)
+cat("=== Random Forest — Test Set ===\n")
+print(rf_cm$overall[c("Accuracy", "Kappa")])
+cat("\nPer-class metrics:\n")
+print(round(rf_cm$byClass[, c("Precision", "Recall", "F1")], 4))
+```
+
+```{r rf-importance, fig.height=6}
+plot(varImp(rf_model), top = 15,
+     main = "Random Forest — Top 15 Feature Importances")
+```
+
+---
+
+# 8. Algorithm 4 — Gradient Boosting Machine (GBM)
+
+**Sequential tree boosting.** Each tree corrects the residual errors of all prior trees
+via gradient descent in function space.
+
+```{r gbm-train}
+set.seed(42)
+gbm_model <- train(
+  Efficiency_Class ~ .,
+  data       = train_df,
+  method     = "gbm",
+  trControl  = cv_ctrl,
+  preProcess = c("center", "scale"),
+  verbose    = FALSE,
+  tuneGrid   = expand.grid(
+    n.trees           = c(100, 200),
+    interaction.depth = c(3, 5),
+    shrinkage         = c(0.05, 0.1),
+    n.minobsinnode    = 10
+  )
+)
+
+cat("GBM — Best n.trees:", gbm_model$bestTune$n.trees, "\n")
+cat("GBM — Best interaction.depth:", gbm_model$bestTune$interaction.depth, "\n")
+cat("GBM — Best shrinkage:", gbm_model$bestTune$shrinkage, "\n")
+cat("GBM — Best CV Accuracy:", round(max(gbm_model$results$Accuracy), 4), "\n")
+```
+
+```{r gbm-predict}
+gbm_pred  <- predict(gbm_model, test_df)
+gbm_probs <- predict(gbm_model, test_df, type = "prob")
+
+gbm_cm <- confusionMatrix(gbm_pred, test_df$Efficiency_Class)
+cat("=== GBM — Test Set ===\n")
+print(gbm_cm$overall[c("Accuracy", "Kappa")])
+cat("\nPer-class metrics:\n")
+print(round(gbm_cm$byClass[, c("Precision", "Recall", "F1")], 4))
+```
+
+```{r gbm-importance, fig.height=6}
+plot(varImp(gbm_model), top = 15,
+     main = "GBM — Top 15 Feature Importances")
+```
+
+---
+
+# 9. Model Comparison
+
+## 9.1 Macro F1-Score Table
+
+```{r macro-f1}
+macro_f1 <- function(cm) round(mean(cm$byClass[, "F1"], na.rm = TRUE), 4)
+
+results_df <- data.frame(
+  Algorithm     = c("Logistic Regression", "KNN", "Random Forest", "GBM"),
+  CV_Accuracy   = round(c(max(lr_model$results$Accuracy),
+                           max(knn_model$results$Accuracy),
+                           max(rf_model$results$Accuracy),
+                           max(gbm_model$results$Accuracy)), 4),
+  Test_Accuracy = round(c(lr_cm$overall["Accuracy"],
+                           knn_cm$overall["Accuracy"],
+                           rf_cm$overall["Accuracy"],
+                           gbm_cm$overall["Accuracy"]), 4),
+  Kappa         = round(c(lr_cm$overall["Kappa"],
+                           knn_cm$overall["Kappa"],
+                           rf_cm$overall["Kappa"],
+                           gbm_cm$overall["Kappa"]), 4),
+  Macro_F1      = c(macro_f1(lr_cm), macro_f1(knn_cm),
+                    macro_f1(rf_cm), macro_f1(gbm_cm))
+)
+
+best_row <- which.max(results_df$Macro_F1)
+
+kable(results_df, caption = "Model Comparison — All Metrics (Baseline = 33.3%)") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = TRUE) %>%
+  row_spec(best_row, bold = TRUE, background = "#d5f5e3") %>%
+  column_spec(5, bold = TRUE)
+```
+
+## 9.2 Accuracy Comparison Plot
+
+```{r comparison-plot, fig.height=5}
+results_long <- results_df %>%
+  pivot_longer(cols = c(CV_Accuracy, Test_Accuracy, Macro_F1),
+               names_to = "Metric", values_to = "Score")
+
+ggplot(results_long, aes(x = reorder(Algorithm, Score), y = Score, fill = Metric)) +
+  geom_col(position = "dodge", color = "white", width = 0.7) +
+  geom_hline(yintercept = 0.333, linetype = "dashed",
+             color = "#e74c3c", linewidth = 0.8) +
+  annotate("text", x = 0.7, y = 0.345, label = "Random baseline (33.3%)",
+           color = "#e74c3c", size = 3.5) +
+  geom_text(aes(label = round(Score, 3)),
+            position = position_dodge(width = 0.7),
+            hjust = -0.1, size = 3, fontface = "bold") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(limits = c(0, 1.1), labels = percent_format()) +
+  coord_flip() +
+  labs(title = "Model Comparison — CV Accuracy vs Test Accuracy vs Macro F1",
+       x = NULL, y = "Score", fill = "Metric") +
+  theme_minimal(base_size = 13)
+```
+
+## 9.3 CV Resampling Distribution
+
+```{r cv-resample-plot, fig.height=5}
+resamps <- resamples(list(LR  = lr_model, KNN = knn_model,
+                          RF  = rf_model, GBM = gbm_model))
+
+bwplot(resamps, metric = "Accuracy",
+       main = "5-Fold CV Accuracy Distribution — All Models")
+```
+
+---
+
+# 10. Confusion Matrices
+
+```{r confusion-matrices, fig.height=10}
+plot_cm <- function(cm_obj, title, palette) {
+  cm_tbl <- as.data.frame(cm_obj$table)
+  names(cm_tbl) <- c("Predicted", "Actual", "Freq")
+  ggplot(cm_tbl, aes(x = Actual, y = Predicted, fill = Freq)) +
+    geom_tile(color = "white", linewidth = 0.8) +
+    geom_text(aes(label = Freq), fontface = "bold", size = 5) +
+    scale_fill_gradient(low = "white", high = palette) +
+    labs(title = title, x = "Actual", y = "Predicted") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "none")
+}
+
+p_lr  <- plot_cm(lr_cm,  "Logistic Regression", "#3498db")
+p_knn <- plot_cm(knn_cm, "KNN",                 "#2ecc71")
+p_rf  <- plot_cm(rf_cm,  "Random Forest",        "#9b59b6")
+p_gbm <- plot_cm(gbm_cm, "GBM",                 "#e67e22")
+
+grid.arrange(p_lr, p_knn, p_rf, p_gbm, ncol = 2,
+             top = "Confusion Matrices — Test Set (Rows = Predicted, Cols = Actual)")
+```
+
+---
+
+# 11. Per-Class Metrics
+
+```{r per-class-metrics, fig.height=7}
+extract_metrics <- function(cm, algo_name) {
+  as.data.frame(cm$byClass[, c("Precision","Recall","F1")]) %>%
+    rownames_to_column("Class") %>%
+    mutate(Class     = str_remove(Class, "Class: "),
+           Algorithm = algo_name)
+}
+
+per_class <- bind_rows(
+  extract_metrics(lr_cm,  "Logistic Regression"),
+  extract_metrics(knn_cm, "KNN"),
+  extract_metrics(rf_cm,  "Random Forest"),
+  extract_metrics(gbm_cm, "GBM")
+) %>%
+  pivot_longer(cols = c(Precision, Recall, F1),
+               names_to = "Metric", values_to = "Value")
+
+ggplot(per_class, aes(x = Algorithm, y = Value, fill = Algorithm)) +
+  geom_col(position = "dodge", color = "white") +
+  geom_text(aes(label = round(Value, 2)),
+            vjust = -0.3, size = 2.8, fontface = "bold") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(limits = c(0, 1.15), labels = percent_format()) +
+  facet_grid(Class ~ Metric) +
+  labs(title = "Per-Class Precision / Recall / F1 by Algorithm",
+       x = NULL, y = "Score") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "none")
+```
+
+---
+
+# 12. ROC Curves (One-vs-Rest)
+
+```{r roc-curves, fig.height=8}
+classes <- levels(test_df$Efficiency_Class)
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+for (cls in classes) {
+  actual_bin <- as.numeric(test_df$Efficiency_Class == cls)
+  roc_lr  <- roc(actual_bin, lr_probs[[cls]],  quiet = TRUE)
+  roc_knn <- roc(actual_bin, knn_probs[[cls]], quiet = TRUE)
+  roc_rf  <- roc(actual_bin, rf_probs[[cls]],  quiet = TRUE)
+  roc_gbm <- roc(actual_bin, gbm_probs[[cls]], quiet = TRUE)
+
+  plot(roc_lr, col = "#3498db", lwd = 2,
+       main = paste("ROC —", cls, "vs Rest"),
+       xlab = "False Positive Rate", ylab = "True Positive Rate")
+  lines(roc_knn, col = "#2ecc71", lwd = 2)
+  lines(roc_rf,  col = "#9b59b6", lwd = 2)
+  lines(roc_gbm, col = "#e67e22", lwd = 2)
+  abline(0, 1, lty = 2, col = "grey60")
+  legend("bottomright",
+         legend = c(paste("LR  AUC =", round(auc(roc_lr),  3)),
+                    paste("KNN AUC =", round(auc(roc_knn), 3)),
+                    paste("RF  AUC =", round(auc(roc_rf),  3)),
+                    paste("GBM AUC =", round(auc(roc_gbm), 3))),
+         col = c("#3498db","#2ecc71","#9b59b6","#e67e22"),
+         lwd = 2, cex = 0.75, bty = "n")
+}
+
+auc_df <- data.frame(
+  Class = classes,
+  LR  = sapply(classes, function(c) round(auc(roc(as.numeric(test_df$Efficiency_Class==c), lr_probs[[c]],  quiet=TRUE)), 4)),
+  KNN = sapply(classes, function(c) round(auc(roc(as.numeric(test_df$Efficiency_Class==c), knn_probs[[c]], quiet=TRUE)), 4)),
+  RF  = sapply(classes, function(c) round(auc(roc(as.numeric(test_df$Efficiency_Class==c), rf_probs[[c]],  quiet=TRUE)), 4)),
+  GBM = sapply(classes, function(c) round(auc(roc(as.numeric(test_df$Efficiency_Class==c), gbm_probs[[c]], quiet=TRUE)), 4))
+)
+par(mfrow = c(1,1))
+```
+
+```{r auc-table}
+kable(auc_df, caption = "AUC per Class (One-vs-Rest) — All Models") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  column_spec(which.max(colMeans(auc_df[,-1])) + 1, bold = TRUE, background = "#d5f5e3")
+```
+
+---
+
+# 13. Feature Importance Comparison
+
+```{r feature-importance-compare, fig.height=7}
+rf_imp_df <- varImp(rf_model)$importance %>%
+  rownames_to_column("Feature") %>%
+  mutate(Importance = rowMeans(dplyr::select(., -Feature)),
+         Algorithm  = "Random Forest") %>%
+  dplyr::select(Feature, Importance, Algorithm) %>%
+  slice_max(Importance, n = 10)
+
+gbm_imp_df <- varImp(gbm_model)$importance %>%
+  rownames_to_column("Feature") %>%
+  mutate(Importance = rowMeans(dplyr::select(., -Feature)),
+         Algorithm  = "GBM") %>%
+  dplyr::select(Feature, Importance, Algorithm) %>%
+  slice_max(Importance, n = 10)
+
+imp_combined <- bind_rows(rf_imp_df, gbm_imp_df)
+
+ggplot(imp_combined,
+       aes(x = reorder(Feature, Importance), y = Importance, fill = Algorithm)) +
+  geom_col(color = "white", width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("Random Forest" = "#9b59b6", "GBM" = "#e67e22")) +
+  facet_wrap(~ Algorithm, scales = "free_x") +
+  labs(title = "Top 10 Feature Importances — Random Forest vs GBM",
+       x = NULL, y = "Importance Score") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+---
+
+# 14. Best Model Deep Dive
+
+```{r best-model-id}
+best_algo <- results_df$Algorithm[which.max(results_df$Macro_F1)]
+best_f1   <- max(results_df$Macro_F1)
+best_acc  <- results_df$Test_Accuracy[which.max(results_df$Macro_F1)]
+cat("Best model:", best_algo, "\n")
+cat("Macro F1:", best_f1, "| Test Accuracy:", best_acc, "\n")
+cat("Improvement over baseline (33.3%):",
+    round((best_acc - 0.333) * 100, 1), "percentage points\n")
+```
+
+## 14.1 Detailed Classification Report
+
+```{r best-model-report}
+best_cm <- switch(best_algo,
+  "Logistic Regression" = lr_cm,
+  "KNN"                 = knn_cm,
+  "Random Forest"       = rf_cm,
+  "GBM"                 = gbm_cm
+)
+
+detail_df <- as.data.frame(best_cm$byClass) %>%
+  rownames_to_column("Class") %>%
+  mutate(Class = str_remove(Class, "Class: ")) %>%
+  rename(Balanced_Accuracy = `Balanced Accuracy`) %>%
+  dplyr::select(Class, Precision, Recall, F1, Specificity, Balanced_Accuracy) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+kable(detail_df, caption = paste("Detailed Classification Report —", best_algo)) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = TRUE) %>%
+  column_spec(4, bold = TRUE, background = "#eaf4fb")
+```
+
+## 14.2 Prediction Confidence Distribution
+
+```{r confidence-dist, fig.height=5}
+best_probs <- switch(best_algo,
+  "Logistic Regression" = lr_probs,
+  "KNN"                 = knn_probs,
+  "Random Forest"       = rf_probs,
+  "GBM"                 = gbm_probs
+)
+best_pred <- switch(best_algo,
+  "Logistic Regression" = lr_pred,
+  "KNN"                 = knn_pred,
+  "Random Forest"       = rf_pred,
+  "GBM"                 = gbm_pred
+)
+
+conf_df <- best_probs %>%
+  mutate(Predicted = best_pred,
+         Actual    = test_df$Efficiency_Class,
+         Correct   = Predicted == Actual,
+         Max_Prob  = pmax(Low, Medium, High))
+
+ggplot(conf_df, aes(x = Max_Prob, fill = Correct)) +
+  geom_histogram(bins = 30, color = "white", alpha = 0.85) +
+  scale_fill_manual(values = c("TRUE" = "#2ecc71", "FALSE" = "#e74c3c"),
+                    labels = c("TRUE" = "Correct", "FALSE" = "Wrong")) +
+  facet_wrap(~ Actual, ncol = 3) +
+  labs(title = paste(best_algo, "— Prediction Confidence by Actual Class"),
+       subtitle = "Green = correct | Red = wrong | X-axis = max predicted probability",
+       x = "Max Class Probability", y = "Count", fill = "Prediction") +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+# 15. Final Summary
+
+```{r final-summary, echo=FALSE}
+summary_tbl <- data.frame(
+  Item = c(
+    "Dataset",
+    "Original target (rejected)",
+    "New target",
+    "Target construction",
+    "Leakage prevention",
+    "Classes",
+    "Class balance",
+    "Train / Test split",
+    "Cross-validation",
+    "Feature scaling",
+    "Algorithms tried",
+    "Primary metric",
+    "Best algorithm",
+    "Best Macro F1",
+    "Best Test Accuracy",
+    "Improvement over baseline"
+  ),
+  Detail = c(
+    "Ship_Performance_Dataset.csv — 2,736 rows × 18 columns",
+    "Maintenance_Status — randomly assigned, ANOVA F < 2 across all features",
+    "Efficiency_Class (Low / Medium / High)",
+    "ntile(Efficiency_nm_per_kWh, 3) — equal-frequency binning into 3 groups",
+    "Efficiency_nm_per_kWh excluded from feature set",
+    "3 ordered classes: Low < Medium < High",
+    "Exactly 33.3% each — perfectly balanced by ntile construction",
+    "80% train / 20% test — stratified by class",
+    "5-fold stratified CV on training set",
+    "Z-score (centre + scale) inside caret pipeline",
+    "Logistic Regression, KNN, Random Forest, GBM",
+    "Macro F1-Score (equal weight across all 3 classes)",
+    best_algo,
+    as.character(best_f1),
+    as.character(best_acc),
+    paste0(round((best_acc - 0.333) * 100, 1), " percentage points above 33.3% baseline")
+  )
+)
+
+kable(summary_tbl, caption = "Classification Pipeline — Final Summary") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = TRUE) %>%
+  row_spec(c(13,14,15,16), bold = TRUE, background = "#d5f5e3")
+```
+
+---
+
+*End of Classification Report*

@@ -1,0 +1,1181 @@
+---
+title: "Segmenting the Fleet: An Unsupervised Analysis of Ship Operational Performance"
+author: "Shipping Performance Analysis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 11,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+
+---
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+library(ggplot2)
+library(cluster)
+library(factoextra)
+library(dbscan)
+library(dendextend)
+library(fpc)
+library(mclust)
+library(knitr)
+library(kableExtra)
+library(scales)
+library(viridis)
+library(gridExtra)
+library(RColorBrewer)
+library(fastDummies)
+library(caret)
+```
+
+---
+
+# 1. Data Loading
+
+```{r load-data}
+df <- read.csv("Ship_Performance_Dataset.csv", stringsAsFactors = FALSE)
+df$Date <- as.Date(df$Date)
+
+cat("Rows:", nrow(df), "| Columns:", ncol(df), "\n")
+```
+
+---
+
+# 2. Feature Engineering & Encoding
+
+## 2.1 Domain Feature Engineering
+
+Raw features like `Revenue_per_Voyage_USD` and `Operational_Cost_USD` carry less
+discriminatory signal separately than their relationship to each other or to operational
+context. Four ratio/composite features are created before clustering to surface sharper
+performance boundaries:
+
+| Feature | Formula | Meaning |
+|---|---|---|
+| `Profit_Margin` | (Revenue − Cost) / Revenue | Profitability rate per voyage |
+| `Cost_per_nm` | Cost / Distance | Operating cost efficiency |
+| `Power_per_Cargo_ton` | Engine_Power / Cargo_Weight | Power loading ratio |
+| `Revenue_per_nm` | Revenue / Distance | Revenue yield per nautical mile |
+| `Speed_Load_ratio` | Speed / Average_Load_Pct | Speed efficiency under load |
+
+```{r domain-features}
+df <- df %>%
+  mutate(
+    Profit_Margin       = (Revenue_per_Voyage_USD - Operational_Cost_USD) /
+                           ifelse(Revenue_per_Voyage_USD == 0, NA, Revenue_per_Voyage_USD),
+    Cost_per_nm         = Operational_Cost_USD /
+                           ifelse(Distance_Traveled_nm == 0, NA, Distance_Traveled_nm),
+    Power_per_Cargo_ton = Engine_Power_kW /
+                           ifelse(Cargo_Weight_tons == 0, NA, Cargo_Weight_tons),
+    Revenue_per_nm      = Revenue_per_Voyage_USD /
+                           ifelse(Distance_Traveled_nm == 0, NA, Distance_Traveled_nm),
+    Speed_Load_ratio    = Speed_Over_Ground_knots /
+                           ifelse(Average_Load_Percentage == 0, NA, Average_Load_Percentage)
+  )
+
+cat("Domain features created:\n")
+cat("  Profit_Margin      — range:", round(range(df$Profit_Margin,       na.rm=TRUE), 4), "\n")
+cat("  Cost_per_nm        — range:", round(range(df$Cost_per_nm,         na.rm=TRUE), 2), "\n")
+cat("  Power_per_Cargo_ton— range:", round(range(df$Power_per_Cargo_ton, na.rm=TRUE), 2), "\n")
+cat("  Revenue_per_nm     — range:", round(range(df$Revenue_per_nm,      na.rm=TRUE), 2), "\n")
+cat("  Speed_Load_ratio   — range:", round(range(df$Speed_Load_ratio,    na.rm=TRUE), 4), "\n")
+```
+
+## 2.2 One-Hot Encoding
+
+`Maintenance_Status` and `Weather_Condition` are one-hot encoded rather than ordinal
+integers. Ordinal encoding imposes a linear order (Good=0 < Fair=1 < Critical=2) that
+Euclidean distance-based clustering treats as a magnitude — making "Critical" appear
+twice as far from "Good" as "Fair" is, which is an arbitrary and misleading assumption.
+One-hot encoding lets each category contribute independently and equally to distance
+calculations, without any implied ordering.
+
+```{r encode}
+df_model <- dummy_cols(
+  df,
+  select_columns      = c("Maintenance_Status", "Weather_Condition"),
+  remove_first_dummy  = TRUE,   # drop one level per variable to avoid perfect multicollinearity
+  remove_selected_columns = TRUE
+)
+```
+
+## 2.2 Select Clustering Features
+
+```{r select-features}
+# Numeric features (original + domain-engineered)
+numeric_features <- c(
+  "Speed_Over_Ground_knots", "Engine_Power_kW",
+  "Distance_Traveled_nm",    "Draft_meters",
+  "Cargo_Weight_tons",       "Operational_Cost_USD",
+  "Revenue_per_Voyage_USD",  "Turnaround_Time_hours",
+  "Efficiency_nm_per_kWh",   "Seasonal_Impact_Score",
+  "Weekly_Voyage_Count",     "Average_Load_Percentage",
+  # Domain-engineered ratio features
+  "Profit_Margin", "Cost_per_nm", "Power_per_Cargo_ton", "Speed_Load_ratio"
+)
+
+# One-hot encoded dummy columns (fastDummies names them as <col>_<level>)
+ohe_features <- names(df_model)[
+  startsWith(names(df_model), "Maintenance_Status_") |
+  startsWith(names(df_model), "Weather_Condition_")
+]
+
+cluster_features <- c(numeric_features, ohe_features)
+
+X_raw <- df_model %>% select(all_of(cluster_features)) %>% drop_na()
+cat("Feature matrix dimensions:", nrow(X_raw), "×", ncol(X_raw), "\n")
+cat("OHE columns added:", paste(ohe_features, collapse = ", "), "\n")
+```
+
+---
+
+# 3. Feature Scaling
+
+## Outlier Winsorization
+
+K-Means centroids are computed as the mean of all assigned points, so a single extreme
+voyage (e.g. an unusually high `Operational_Cost_USD`) drags a centroid away from the
+true cluster centre. Winsorization caps every numeric feature at the **1st and 99th
+percentile** values — extreme observations are clipped to the boundary rather than
+removed, preserving all 2,600 rows.
+
+```{r winsorise}
+winsorise_col <- function(x, lo = 0.01, hi = 0.99) {
+  bounds <- quantile(x, probs = c(lo, hi), na.rm = TRUE)
+  pmax(pmin(x, bounds[2]), bounds[1])
+}
+
+X_wins <- as.data.frame(lapply(X_raw, winsorise_col))
+
+# Report how many values were clipped per feature
+n_clipped <- mapply(function(orig, wins) sum(orig != wins, na.rm = TRUE),
+                    X_raw, X_wins)
+clip_df <- data.frame(Feature  = names(n_clipped),
+                      Clipped  = as.integer(n_clipped),
+                      Pct      = round(n_clipped / nrow(X_raw) * 100, 2))
+clip_df <- clip_df[clip_df$Clipped > 0, ]
+
+kable(clip_df, caption = "Values clipped per feature (1st–99th percentile winsorization)") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+## Z-Score Standardisation
+
+Each feature is centred to mean = 0 and scaled to SD = 1. This prevents features
+measured in large units (USD costs) from dominating distance calculations.
+
+```{r scale}
+X_scaled <- scale(X_wins)   # scale winsorised matrix, not raw
+
+# Confirm scaling
+scaling_check <- data.frame(
+  Feature = colnames(X_scaled),
+  Mean    = round(colMeans(X_scaled), 6),
+  SD      = round(apply(X_scaled, 2, sd), 6)
+)
+
+kable(scaling_check, caption = "Post-Scaling: All features have mean ≈ 0, SD = 1") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+---
+
+## Correlation Filtering
+
+High pairwise correlation between features inflates redundant distance dimensions,
+diluting cluster separation. Features with |r| > 0.75 against any other feature are
+removed — the retained set carries the same information with less redundancy.
+
+```{r corr-filter}
+library(caret)
+
+cor_mat     <- cor(X_scaled)
+high_cor_idx <- findCorrelation(cor_mat, cutoff = 0.75, verbose = FALSE)
+
+if (length(high_cor_idx) > 0) {
+  removed_features <- colnames(X_scaled)[high_cor_idx]
+  cat("Removed", length(removed_features), "highly correlated feature(s):\n")
+  cat(paste(" -", removed_features, collapse = "\n"), "\n")
+  X_filtered <- X_scaled[, -high_cor_idx]
+} else {
+  cat("No features exceeded the |r| > 0.75 threshold — all retained.\n")
+  X_filtered <- X_scaled
+}
+
+cat("\nFeature matrix after correlation filter:", nrow(X_filtered), "×", ncol(X_filtered), "\n")
+```
+
+---
+
+## PCA Dimensionality Reduction
+
+Clustering in many dimensions suffers from the **curse of dimensionality** — in high
+dimensions, all points tend to appear equidistant, which directly degrades silhouette
+scores. PCA rotates the feature space into uncorrelated principal components ordered by
+variance explained. We retain the minimum number of components that cumulatively explain
+≥ 85 % of variance.
+
+```{r pca-reduce, fig.height=5}
+pca_obj  <- prcomp(X_filtered, center = FALSE)   # already centred by scale()
+cumvar   <- cumsum(pca_obj$sdev^2) / sum(pca_obj$sdev^2)
+n_comp   <- which(cumvar >= 0.85)[1]
+
+cat("Components retained:", n_comp, "of", ncol(X_filtered), "\n")
+cat("Variance explained: ", round(cumvar[n_comp] * 100, 1), "%\n")
+
+# Scree plot
+scree_df <- data.frame(
+  PC  = seq_along(cumvar),
+  Cum = round(cumvar * 100, 1)
+)
+ggplot(scree_df[1:min(20, nrow(scree_df)), ], aes(x = PC, y = Cum)) +
+  geom_line(colour = "#2980b9", linewidth = 1) +
+  geom_point(colour = "#2980b9", size = 2.5) +
+  geom_hline(yintercept = 85, linetype = "dashed", colour = "#e74c3c") +
+  geom_vline(xintercept = n_comp, linetype = "dashed", colour = "#e74c3c") +
+  annotate("text", x = n_comp + 0.4, y = 78,
+           label = paste0("PC", n_comp, " — 85% threshold"),
+           colour = "#e74c3c", hjust = 0, size = 4) +
+  labs(title = "PCA Cumulative Variance Explained",
+       x = "Principal Component", y = "Cumulative Variance (%)") +
+  theme_minimal(base_size = 13)
+
+X_pca    <- as.matrix(pca_obj$x[, 1:n_comp])
+X_scaled <- X_pca
+cat("\nFull-pipeline feature matrix:", ncol(X_scaled), "principal components.\n")
+```
+
+---
+
+## Focused 5-Feature Efficiency & Financial Subset
+
+After running the full 19-feature pipeline, we observe that mixing operational noise
+dimensions (engine power, draft, turnaround, weather dummies) with pure performance
+signals dilutes cluster boundaries. A **focused 5-feature subset** isolates only the
+most discriminatory efficiency and financial ratio signals:
+
+| # | Feature | Type | Rationale |
+|---|---|---|---|
+| 1 | `Profit_Margin` | Financial ratio | Core profitability — spans positive to loss-making voyages |
+| 2 | `Cost_per_nm` | Efficiency ratio | Normalises cost by route length for fair comparison |
+| 3 | `Power_per_Cargo_ton` | Operational ratio | Power utilisation relative to payload |
+| 4 | `Revenue_per_nm` | Financial ratio | Revenue yield per nautical mile travelled |
+| 5 | `Efficiency_nm_per_kWh` | Original metric | Direct fuel efficiency — already in the dataset |
+
+This subset removes all noise dimensions while retaining the full performance signal.
+
+```{r focus-subset, fig.height=5}
+focus_features <- c(
+  "Profit_Margin", "Cost_per_nm", "Power_per_Cargo_ton",
+  "Revenue_per_nm", "Efficiency_nm_per_kWh"
+)
+
+# Pull directly from df (pre-OHE) — raw data untouched
+X_focus_raw <- df %>% select(all_of(focus_features)) %>% drop_na()
+cat("Focused matrix dimensions:", nrow(X_focus_raw), "×", ncol(X_focus_raw), "\n")
+
+# Winsorise each focused feature at 1st–99th percentile
+winsorise_col <- function(x, lo = 0.01, hi = 0.99) {
+  bounds <- quantile(x, probs = c(lo, hi), na.rm = TRUE)
+  pmax(pmin(x, bounds[2]), bounds[1])
+}
+X_focus_wins <- as.data.frame(lapply(X_focus_raw, winsorise_col))
+
+# Z-score scale the winsorised focused features
+X_focus_scaled <- scale(X_focus_wins)
+
+# Confirm scaling
+focus_check <- data.frame(
+  Feature = colnames(X_focus_scaled),
+  Mean    = round(colMeans(X_focus_scaled), 6),
+  SD      = round(apply(X_focus_scaled, 2, sd), 6)
+)
+kable(focus_check, caption = "Focused 5-Feature Subset — Post-Scaling Verification") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+
+# K-selection silhouette scan on focused features
+set.seed(42)
+sil_scan <- sapply(2:10, function(k) {
+  km_tmp <- kmeans(X_focus_scaled, centers = k, nstart = 50, iter.max = 300)
+  mean(silhouette(km_tmp$cluster, dist(X_focus_scaled))[, 3])
+})
+sil_scan_df <- data.frame(K = 2:10, Silhouette = round(sil_scan, 4))
+
+ggplot(sil_scan_df, aes(x = K, y = Silhouette)) +
+  geom_line(colour = "#27ae60", linewidth = 1) +
+  geom_point(colour = "#27ae60", size = 3) +
+  geom_vline(xintercept = 3, linetype = "dashed", colour = "#e74c3c") +
+  annotate("text", x = 3.2, y = min(sil_scan_df$Silhouette) + 0.02,
+           label = "K=3 selected\n(operationally meaningful)", colour = "#e74c3c",
+           hjust = 0, size = 3.5) +
+  labs(title = "Focused Subset — Silhouette Score by K (K-Means)",
+       subtitle = "K=2 peaks; K=3 chosen for 3 operationally distinct archetypes",
+       x = "Number of Clusters (K)", y = "Average Silhouette Width") +
+  theme_minimal(base_size = 13)
+
+cat("\nSilhouette scores by K:\n")
+print(sil_scan_df)
+
+# Override X_scaled — all downstream algorithm chunks now use the focused 5-feature matrix
+X_scaled <- X_focus_scaled
+cat("\nX_scaled overridden → X_focus_scaled (5 features). All algorithms use focused subset.\n")
+```
+
+---
+
+# 4. Determine Optimal K
+
+## 4.1 Elbow Method (Within-Cluster Sum of Squares)
+
+```{r elbow, fig.height=5}
+set.seed(42)
+fviz_nbclust(X_scaled, kmeans,
+             method  = "wss",
+             k.max   = 12,
+             linecolor = "#2980b9") +
+  geom_vline(xintercept = 4, linetype = "dashed", color = "#e74c3c") +
+  labs(title = "Elbow Method — Within-Cluster Sum of Squares",
+       subtitle = "Look for the 'elbow' where WSS stops dropping sharply") +
+  theme_minimal(base_size = 13)
+```
+
+## 4.2 Silhouette Score
+
+The silhouette score measures how well each point fits its assigned cluster vs the
+nearest neighbouring cluster. Scores range from -1 (wrong cluster) to +1 (perfect fit).
+The K with the highest average silhouette is the most cohesive partition.
+
+```{r silhouette, fig.height=5}
+set.seed(42)
+fviz_nbclust(X_scaled, kmeans,
+             method    = "silhouette",
+             k.max     = 12,
+             linecolor = "#27ae60") +
+  labs(title = "Silhouette Method — Average Silhouette Width",
+       subtitle = "Higher is better — K with peak score is optimal") +
+  theme_minimal(base_size = 13)
+```
+
+## 4.3 Gap Statistic
+
+```{r gap, fig.height=5}
+set.seed(42)
+gap_stat <- clusGap(X_scaled, FUN = kmeans, nstart = 25, K.max = 10, B = 30)
+
+fviz_gap_stat(gap_stat, linecolor = "#8e44ad") +
+  labs(title = "Gap Statistic — Comparing Cluster Compactness to Null Reference",
+       subtitle = "Optimal K = largest gap before it levels off") +
+  theme_minimal(base_size = 13)
+```
+
+## 4.4 K Decision
+
+```{r k-decision}
+# Read elbow, silhouette, gap outputs and choose K
+chosen_k <- 3
+
+cat("Selected K =", chosen_k, "\n")
+cat("Rationale: K=2 peaks on silhouette but yields only 2 archetypes.\n")
+cat("K=3 maintains excellent cohesion while revealing three operationally\n")
+cat("distinct performance tiers — high-efficiency, moderate, and stressed voyages.\n")
+```
+
+> **K = 4** is used for K-Means and Hierarchical clustering.
+> DBSCAN determines its own number of clusters via density.
+
+---
+
+# 5. Algorithm 1 — K-Means
+
+## 5.1 Fit K-Means
+
+```{r kmeans-fit}
+set.seed(42)
+km_result <- kmeans(X_scaled, centers = chosen_k, nstart = 50, iter.max = 300)
+
+# Attach labels to original data
+df_km <- X_raw %>%
+  mutate(KMeans_Cluster = factor(km_result$cluster))
+
+cat("Cluster sizes:\n")
+print(table(km_result$cluster))
+cat("\nWithin-cluster sum of squares:", round(km_result$tot.withinss, 1), "\n")
+cat("Between-cluster SS / Total SS:", round(km_result$betweenss / km_result$totss * 100, 1), "%\n")
+```
+
+## 5.2 Cluster Visualisation — PCA Projection
+
+```{r kmeans-pca-plot}
+fviz_cluster(km_result,
+             data         = X_scaled,
+             geom         = "point",
+             ellipse.type = "convex",
+             palette      = "Set2",
+             alpha        = 0.5,
+             ggtheme      = theme_minimal(base_size = 13)) +
+  labs(title = "K-Means Clusters — PCA Projection (PC1 vs PC2)",
+       subtitle = paste("K =", chosen_k, "| Coloured ellipses = cluster boundaries"))
+```
+
+## 5.3 Silhouette Plot — K-Means Quality
+
+```{r kmeans-silhouette}
+km_sil <- silhouette(km_result$cluster, dist(X_scaled))
+
+fviz_silhouette(km_sil, palette = "Set2", ggtheme = theme_minimal(base_size = 12)) +
+  labs(title = "Silhouette Plot — K-Means",
+       subtitle = "Bars below 0 indicate misclassified points")
+
+cat("\nAverage silhouette width:", round(mean(km_sil[, 3]), 4), "\n")
+```
+
+## 5.4 Cluster Profiles — Mean Feature Values
+
+```{r kmeans-profiles}
+km_profiles <- df_km %>%
+  group_by(KMeans_Cluster) %>%
+  summarise(across(where(is.numeric), ~ round(mean(.x, na.rm=TRUE), 2)),
+            Count = n(), .groups = "drop")
+
+kable(t(km_profiles), caption = "K-Means Cluster Profiles — Mean Feature Values") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 11)
+```
+
+## 5.5 Cluster Profile Heatmap
+
+```{r kmeans-heatmap, fig.height=7}
+km_heat <- df_km %>%
+  group_by(KMeans_Cluster) %>%
+  summarise(across(where(is.numeric), mean, .names = "{.col}"), .groups = "drop") %>%
+  pivot_longer(-KMeans_Cluster, names_to = "Feature", values_to = "Mean_Value")
+
+# Z-score within each feature for heatmap readability
+km_heat <- km_heat %>%
+  group_by(Feature) %>%
+  mutate(Z_Score = scale(Mean_Value)[,1]) %>%
+  ungroup()
+
+ggplot(km_heat, aes(x = KMeans_Cluster, y = Feature, fill = Z_Score)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = round(Mean_Value, 1)), size = 2.8, fontface = "bold") +
+  scale_fill_gradient2(low = "#2980b9", mid = "white", high = "#e74c3c",
+                       midpoint = 0, name = "Z-Score") +
+  labs(title = "K-Means Cluster Profile Heatmap",
+       subtitle = "Cell colour = Z-score relative to other clusters; cell text = raw mean",
+       x = "Cluster", y = "Feature") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_text(size = 10))
+```
+
+---
+
+# 6. Algorithm 2 — Hierarchical Clustering (Ward Linkage)
+
+## 6.1 Compute Distance Matrix & Fit
+
+```{r hclust-fit}
+# Use a sample for dendrogram readability (full matrix is large)
+set.seed(42)
+sample_idx <- sample(1:nrow(X_scaled), 300)
+X_sample   <- X_scaled[sample_idx, ]
+
+dist_mat  <- dist(X_scaled, method = "euclidean")
+hc_result <- hclust(dist_mat, method = "ward.D2")
+
+cat("Hierarchical clustering complete.\n")
+cat("Method: Ward.D2 (minimises total within-cluster variance)\n")
+```
+
+## 6.2 Dendrogram
+
+```{r dendrogram, fig.height=7, fig.width=12}
+# Sample dendrogram for visualisation
+dist_sample <- dist(X_sample, method = "euclidean")
+hc_sample   <- hclust(dist_sample, method = "ward.D2")
+
+dend <- as.dendrogram(hc_sample)
+dend <- color_branches(dend, k = chosen_k)
+
+par(mar = c(4, 2, 3, 1))
+plot(dend,
+     main   = paste("Hierarchical Clustering Dendrogram (Ward.D2) — Sample of 300"),
+     sub    = paste("Cut at K =", chosen_k, "clusters"),
+     xlab   = "",
+     ylab   = "Height (Within-cluster variance)",
+     leaflab = "none",
+     cex.main = 1.2)
+abline(h = rev(hc_sample$height)[chosen_k], lty = 2, col = "#e74c3c", lwd = 2)
+legend("topright", legend = paste("Cluster", 1:chosen_k),
+       fill = c("#1b9e77","#d95f02","#7570b3","#e7298a")[1:chosen_k],
+       border = NA, bty = "n")
+```
+
+## 6.3 Cut Tree & Attach Labels
+
+```{r hclust-cut}
+hc_labels <- cutree(hc_result, k = chosen_k)
+
+df_hc <- X_raw %>%
+  mutate(HC_Cluster = factor(hc_labels))
+
+cat("Hierarchical cluster sizes:\n")
+print(table(hc_labels))
+```
+
+## 6.4 Visualisation — PCA Projection
+
+```{r hclust-pca-plot}
+fviz_cluster(list(data = X_scaled, cluster = hc_labels),
+             geom         = "point",
+             ellipse.type = "convex",
+             palette      = "Dark2",
+             alpha        = 0.5,
+             ggtheme      = theme_minimal(base_size = 13)) +
+  labs(title = "Hierarchical Clusters (Ward.D2) — PCA Projection",
+       subtitle = paste("K =", chosen_k, "cut from dendrogram"))
+```
+
+## 6.5 Silhouette — Hierarchical Quality
+
+```{r hclust-silhouette}
+hc_sil <- silhouette(hc_labels, dist_mat)
+
+fviz_silhouette(hc_sil, palette = "Dark2", ggtheme = theme_minimal(base_size = 12)) +
+  labs(title = "Silhouette Plot — Hierarchical Clustering (Ward.D2)")
+
+cat("\nAverage silhouette width:", round(mean(hc_sil[, 3]), 4), "\n")
+```
+
+## 6.6 Cluster Profiles
+
+```{r hclust-profiles}
+hc_profiles <- df_hc %>%
+  group_by(HC_Cluster) %>%
+  summarise(across(where(is.numeric), ~ round(mean(.x, na.rm=TRUE), 2)),
+            Count = n(), .groups = "drop")
+
+kable(t(hc_profiles), caption = "Hierarchical Cluster Profiles — Mean Feature Values") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 11)
+```
+
+---
+
+# 7. Algorithm 3 — DBSCAN
+
+DBSCAN (Density-Based Spatial Clustering of Applications with Noise) discovers clusters
+of arbitrary shape and automatically labels low-density points as noise (cluster = 0).
+It requires no pre-specified K.
+
+## 7.1 Tune eps — k-NN Distance Plot
+
+The `eps` parameter defines the neighbourhood radius. The k-NN distance plot sorts
+all points by their distance to the k-th nearest neighbour. The "elbow" in this plot
+is the recommended `eps` value.
+
+```{r dbscan-eps, fig.height=5}
+# Use k = 2 * dimensions - 1 as rule of thumb for minPts
+minPts_val <- 2 * ncol(X_scaled) - 1
+cat("Recommended minPts:", minPts_val, "\n")
+
+kNNdistplot(X_scaled, k = minPts_val)
+title(main = paste("k-NN Distance Plot (k =", minPts_val, ") — Find eps at Elbow"))
+abline(h = 5.5, lty = 2, col = "#e74c3c", lwd = 2)
+```
+
+## 7.2 Fit DBSCAN
+
+```{r dbscan-fit}
+set.seed(42)
+db_result <- dbscan::dbscan(X_scaled, eps = 1.0, minPts = minPts_val)
+
+cat("DBSCAN results:\n")
+print(db_result)
+
+# Cluster 0 = noise points
+cluster_counts <- table(db_result$cluster)
+cat("\nCluster distribution (0 = noise):\n")
+print(cluster_counts)
+cat("\nNoise points:", sum(db_result$cluster == 0),
+    "(", round(mean(db_result$cluster == 0)*100, 1), "% of data)\n")
+```
+
+## 7.3 Visualisation — PCA Projection
+
+```{r dbscan-pca-plot}
+fviz_cluster(db_result,
+             data    = X_scaled,
+             geom    = "point",
+             palette = c("grey60", brewer.pal(max(db_result$cluster), "Set1")),
+             alpha   = 0.5,
+             ggtheme = theme_minimal(base_size = 13)) +
+  labs(title = "DBSCAN Clusters — PCA Projection",
+       subtitle = paste("eps =", 5.5, "| minPts =", minPts_val,
+                        "| Cluster 0 (grey) = noise"))
+```
+
+## 7.4 DBSCAN Silhouette (Non-noise Points Only)
+
+```{r dbscan-silhouette}
+non_noise     <- db_result$cluster != 0
+n_db_clusters <- length(unique(db_result$cluster[non_noise]))
+
+if (n_db_clusters >= 2) {
+  db_dist <- dist(X_scaled[non_noise, ])
+  db_sil  <- silhouette(db_result$cluster[non_noise], db_dist)
+  fviz_silhouette(db_sil, palette = "Set1", ggtheme = theme_minimal(base_size = 12)) +
+    labs(title = "Silhouette Plot — DBSCAN (noise excluded)")
+  cat("\nAverage silhouette width (non-noise):", round(mean(db_sil[, 3]), 4), "\n")
+} else {
+  cat("Only 1 non-noise cluster found — silhouette not applicable.\n")
+  cat("Consider adjusting eps or minPts.\n")
+}
+```
+
+---
+
+# 8. Algorithm 4 — Gaussian Mixture Models (GMM)
+
+GMM is a **model-based clustering** approach. It assumes the data is generated from a
+mixture of K multivariate Gaussian distributions, each with its own mean and covariance
+structure. Parameters are estimated via the **EM (Expectation-Maximisation)** algorithm.
+
+Unlike K-Means which makes hard assignments, GMM produces **soft probabilities** —
+each observation receives a probability of belonging to every cluster.
+The best model (number of clusters + covariance type) is selected automatically via **BIC**
+(Bayesian Information Criterion — lower is better).
+
+## 8.1 Fit GMM — BIC Model Selection
+
+```{r gmm-bic, fig.height=5}
+set.seed(42)
+gmm_bic <- mclustBIC(X_scaled, G = 1:10, verbose = FALSE)
+
+plot(gmm_bic,
+     main = "GMM — BIC by Number of Components and Covariance Model",
+     legendArgs = list(x = "bottomright", cex = 0.7))
+```
+
+```{r gmm-fit}
+set.seed(42)
+gmm_result <- Mclust(X_scaled, G = 1:10, x = gmm_bic, verbose = FALSE)
+
+cat("Best GMM model:", gmm_result$modelName, "\n")
+cat("  VEI = Variable volume, Equal shape, Axis-aligned orientation\n\n")
+cat("Optimal number of clusters (K):", gmm_result$G, "\n")
+cat("BIC:", round(gmm_result$bic, 2), "\n")
+cat("\nCluster sizes:\n")
+print(table(gmm_result$classification))
+```
+
+## 8.2 Covariance Model Explanation
+
+```{r gmm-model-explain, echo=FALSE}
+gmm_models <- data.frame(
+  Model    = c("EII","VII","EEI","VEI","EVI","VVI","EEE","VEE","EVE","VVE","EEV","VEV","EVV","VVV"),
+  Volume   = c("E","V","E","V","E","V","E","V","E","V","E","V","E","V"),
+  Shape    = c("I","I","E","E","V","V","E","E","E","E","V","V","V","V"),
+  Orient   = c("I","I","I","I","I","I","A","A","A","A","A","A","A","A"),
+  Description = c(
+    "Spherical, equal size","Spherical, variable size",
+    "Diagonal, equal shape","Diagonal, equal shape, variable size",
+    "Diagonal, variable shape","Diagonal, variable shape/size",
+    "Elliptical, equal","Elliptical, equal shape",
+    "Elliptical, equal volume/orient","Elliptical, equal orientation",
+    "Elliptical, equal volume/shape","Elliptical, equal shape",
+    "Elliptical, equal volume","Elliptical, fully variable"
+  )
+)
+selected_row <- which(gmm_models$Model == gmm_result$modelName)
+
+kable(gmm_models, caption = "GMM Covariance Model Codes — Selected model is highlighted") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE, font_size = 11) %>%
+  row_spec(selected_row, bold = TRUE, background = "#d5f5e3")
+```
+
+## 8.3 Visualisation — PCA Projection
+
+```{r gmm-pca-plot}
+fviz_cluster(list(data = X_scaled, cluster = gmm_result$classification),
+             geom         = "point",
+             ellipse.type = "convex",
+             palette      = "Set1",
+             alpha        = 0.5,
+             ggtheme      = theme_minimal(base_size = 13)) +
+  labs(title = "GMM Clusters — PCA Projection",
+       subtitle = paste("K =", gmm_result$G,
+                        "| Model:", gmm_result$modelName,
+                        "| BIC:", round(gmm_result$bic, 1)))
+```
+
+## 8.4 Uncertainty Plot — Soft Membership
+
+A key advantage of GMM over K-Means: each point has a **classification uncertainty**.
+Points near cluster boundaries have high uncertainty (lighter colour); points in the
+dense core have low uncertainty (darker colour).
+
+```{r gmm-uncertainty, fig.height=5}
+plot(gmm_result, what = "uncertainty",
+     main = "GMM Classification Uncertainty\n(Darker = more certain assignment)")
+```
+
+## 8.5 Silhouette — GMM Quality
+
+```{r gmm-silhouette}
+gmm_sil <- silhouette(gmm_result$classification, dist(X_scaled))
+
+fviz_silhouette(gmm_sil, palette = "Set1", ggtheme = theme_minimal(base_size = 12)) +
+  labs(title = "Silhouette Plot — GMM")
+
+cat("\nAverage silhouette width:", round(mean(gmm_sil[, 3]), 4), "\n")
+```
+
+## 8.6 GMM Cluster Profiles
+
+```{r gmm-profiles}
+df_gmm <- as.data.frame(X_raw) %>%
+  mutate(GMM_Cluster = factor(gmm_result$classification))
+
+gmm_profiles <- df_gmm %>%
+  group_by(GMM_Cluster) %>%
+  summarise(across(where(is.numeric), ~ round(mean(.x, na.rm=TRUE), 2)),
+            Count = n(), .groups = "drop")
+
+kable(t(gmm_profiles), caption = "GMM Cluster Profiles — Mean Feature Values") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 11)
+```
+
+---
+
+# 9. Algorithm 5 — K-Medoids (PAM)
+
+PAM (Partitioning Around Medoids) is a **robust alternative to K-Means**. Instead of
+using the mean as the cluster centre, PAM uses an actual data point — the **medoid** —
+as the representative. This makes PAM significantly less sensitive to outliers.
+
+Key difference from K-Means:
+
+| | K-Means | PAM |
+|--|---------|-----|
+| Cluster centre | Mean (may not exist in data) | Actual data point (medoid) |
+| Outlier sensitivity | High | Low |
+| Interpretability | Abstract centroid | Real voyage you can inspect |
+| Speed | Fast | Slower (O(n²)) |
+
+## 9.1 Fit PAM
+
+```{r pam-fit}
+set.seed(42)
+pam_result <- pam(X_scaled, k = chosen_k, metric = "euclidean")
+
+cat("PAM cluster sizes:\n")
+print(table(pam_result$clustering))
+
+cat("\nMedoid indices (row numbers of representative voyages):\n")
+print(pam_result$id.med)
+
+cat("\nAverage silhouette width:", round(pam_result$silinfo$avg.width, 4), "\n")
+```
+
+## 9.2 Visualisation — PCA Projection
+
+```{r pam-pca-plot}
+fviz_cluster(pam_result,
+             geom         = "point",
+             ellipse.type = "convex",
+             palette      = "Dark2",
+             alpha        = 0.5,
+             ggtheme      = theme_minimal(base_size = 13)) +
+  labs(title = "PAM (K-Medoids) Clusters — PCA Projection",
+       subtitle = paste("K =", chosen_k,
+                        "| Stars = medoid points (real voyages)"))
+```
+
+## 9.3 Silhouette Plot — PAM Quality
+
+```{r pam-silhouette}
+pam_sil <- silhouette(pam_result$clustering, dist(X_scaled))
+
+fviz_silhouette(pam_sil, palette = "Dark2", ggtheme = theme_minimal(base_size = 12)) +
+  labs(title = "Silhouette Plot — PAM (K-Medoids)")
+
+cat("\nAverage silhouette width:", round(mean(pam_sil[, 3]), 4), "\n")
+```
+
+## 9.4 Medoid Voyages — Who Represents Each Cluster?
+
+The medoids are **real rows in the dataset** — actual voyages that best represent their
+cluster. This is the interpretability advantage of PAM over K-Means.
+
+```{r pam-medoids}
+# Track original row positions before drop_na so we can look up medoids in df
+df_model_clean <- df_model %>%
+  mutate(.orig_row = row_number()) %>%
+  drop_na(all_of(cluster_features))
+
+medoid_orig_rows <- df_model_clean$.orig_row[pam_result$id.med]
+
+# Use original df (pre-OHE) so Maintenance_Status / Weather_Condition labels are readable
+medoid_voyages <- df[medoid_orig_rows, ] %>%
+  select(Ship_Type, Route_Type, Engine_Type, Maintenance_Status,
+         Speed_Over_Ground_knots, Efficiency_nm_per_kWh,
+         Operational_Cost_USD, Revenue_per_Voyage_USD,
+         Cargo_Weight_tons, Average_Load_Percentage) %>%
+  mutate(Cluster = paste("Cluster", 1:chosen_k), .before = 1)
+
+kable(medoid_voyages,
+      caption = "PAM Medoid Voyages — The Real Data Points Representing Each Cluster",
+      digits  = 1) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = TRUE, font_size = 11) %>%
+  column_spec(1, bold = TRUE, background = "#eaf4fb")
+```
+
+## 9.5 PAM Cluster Profiles
+
+```{r pam-profiles}
+df_pam <- as.data.frame(X_raw) %>%
+  mutate(PAM_Cluster = factor(pam_result$clustering))
+
+pam_profiles <- df_pam %>%
+  group_by(PAM_Cluster) %>%
+  summarise(across(where(is.numeric), ~ round(mean(.x, na.rm=TRUE), 2)),
+            Count = n(), .groups = "drop")
+
+kable(t(pam_profiles), caption = "PAM Cluster Profiles — Mean Feature Values") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 11)
+```
+
+---
+
+# 10. Algorithm Comparison
+
+```{r algo-comparison}
+# Collect all silhouette scores
+km_avg_sil  <- round(mean(silhouette(km_result$cluster,     dist(X_scaled))[, 3]), 4)
+hc_avg_sil  <- round(mean(hc_sil[, 3]), 4)
+gmm_avg_sil <- round(mean(silhouette(gmm_result$classification, dist(X_scaled))[, 3]), 4)
+pam_avg_sil <- round(mean(pam_sil[, 3]), 4)
+
+db_sil_score <- if (n_db_clusters >= 2) {
+  round(mean(silhouette(db_result$cluster[non_noise], dist(X_scaled[non_noise,]))[, 3]), 4)
+} else { NA }
+
+all_sil <- c(km_avg_sil, hc_avg_sil, db_sil_score, gmm_avg_sil, pam_avg_sil)
+
+comparison_df <- data.frame(
+  Algorithm      = c("K-Means", "Hierarchical (Ward.D2)", "DBSCAN",
+                     "GMM (EM)", "PAM (K-Medoids)"),
+  Paradigm       = c("Centroid-based", "Connectivity-based", "Density-based",
+                     "Model-based", "Centroid-based (robust)"),
+  Clusters_Found = c(chosen_k, chosen_k,
+                     length(unique(db_result$cluster[non_noise])),
+                     gmm_result$G, chosen_k),
+  Noise_Points   = c(0, 0, sum(db_result$cluster == 0), 0, 0),
+  Avg_Silhouette = all_sil,
+  K_Required     = c("Yes", "Yes", "No", "Auto (BIC)", "Yes"),
+  Outlier_Robust = c("No", "No", "Yes", "Partial", "Yes"),
+  Soft_Assign    = c("No", "No", "No", "Yes", "No"),
+  Best_For       = c("Compact spherical clusters",
+                     "Nested hierarchical structure",
+                     "Irregular shapes + noise",
+                     "Probabilistic membership + shape flexibility",
+                     "Interpretable centres + outlier robustness")
+)
+
+kable(comparison_df, caption = "Full Algorithm Comparison — 5 Methods") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = TRUE, font_size = 11) %>%
+  row_spec(which.max(all_sil), bold = TRUE, background = "#d5f5e3") %>%
+  column_spec(5, bold = TRUE)
+```
+
+---
+
+# 11. Cluster Interpretation — K-Means (Best Result)
+
+We use K-Means labels for interpretation as it produced the most balanced, well-separated
+clusters. The goal here is to understand **what each cluster represents operationally**.
+
+## 11.1 Attach Descriptors Back
+
+```{r attach-descriptors}
+# Match rows back to original df (after drop_na alignment)
+# Re-attach original categorical columns from df using tracked row indices
+df_interp <- df_model %>%
+  mutate(.orig_row = row_number()) %>%
+  drop_na(all_of(cluster_features)) %>%
+  mutate(
+    KMeans_Cluster    = factor(km_result$cluster),
+    HC_Cluster        = factor(hc_labels),
+    DBSCAN_Cluster    = factor(db_result$cluster),
+    GMM_Cluster       = factor(gmm_result$classification),
+    PAM_Cluster       = factor(pam_result$clustering),
+    Maintenance_Status = df$Maintenance_Status[.orig_row],
+    Weather_Condition  = df$Weather_Condition[.orig_row]
+  )
+```
+
+## 11.2 Cross-Tab: Cluster × Ship Type
+
+```{r cross-ship}
+ct_ship <- df_interp %>%
+  dplyr::count(KMeans_Cluster, Ship_Type) %>%
+  group_by(KMeans_Cluster) %>%
+  mutate(Pct = round(n / sum(n) * 100, 1)) %>%
+  ungroup()
+
+ggplot(ct_ship, aes(x = KMeans_Cluster, y = Pct, fill = Ship_Type)) +
+  geom_col(position = "fill", color = "white") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Cluster Composition by Ship Type",
+       x = "K-Means Cluster", y = "Proportion", fill = "Ship Type") +
+  theme_minimal(base_size = 13)
+```
+
+## 11.3 Cross-Tab: Cluster × Route Type
+
+```{r cross-route}
+ct_route <- df_interp %>%
+  dplyr::count(KMeans_Cluster, Route_Type) %>%
+  group_by(KMeans_Cluster) %>%
+  mutate(Pct = round(n / sum(n) * 100, 1)) %>%
+  ungroup()
+
+ggplot(ct_route, aes(x = KMeans_Cluster, y = Pct, fill = Route_Type)) +
+  geom_col(position = "fill", color = "white") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Cluster Composition by Route Type",
+       x = "K-Means Cluster", y = "Proportion", fill = "Route Type") +
+  theme_minimal(base_size = 13)
+```
+
+## 11.4 Cross-Tab: Cluster × Engine Type
+
+```{r cross-engine}
+ct_engine <- df_interp %>%
+  dplyr::count(KMeans_Cluster, Engine_Type) %>%
+  group_by(KMeans_Cluster) %>%
+  mutate(Pct = round(n / sum(n) * 100, 1)) %>%
+  ungroup()
+
+ggplot(ct_engine, aes(x = KMeans_Cluster, y = Pct, fill = Engine_Type)) +
+  geom_col(position = "fill", color = "white") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_brewer(palette = "Pastel1") +
+  labs(title = "Cluster Composition by Engine Type",
+       x = "K-Means Cluster", y = "Proportion", fill = "Engine Type") +
+  theme_minimal(base_size = 13)
+```
+
+## 11.5 Cross-Tab: Cluster × Maintenance Status
+
+```{r cross-maintenance}
+ct_maint <- df_interp %>%
+  dplyr::count(KMeans_Cluster, Maintenance_Status) %>%
+  group_by(KMeans_Cluster) %>%
+  mutate(Pct = round(n / sum(n) * 100, 1)) %>%
+  ungroup()
+
+ggplot(ct_maint, aes(x = KMeans_Cluster, y = Pct, fill = Maintenance_Status)) +
+  geom_col(position = "fill", color = "white") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("Good" = "#2ecc71", "Fair" = "#f39c12",
+                               "Critical" = "#e74c3c")) +
+  labs(title = "Cluster Composition by Maintenance Status",
+       x = "K-Means Cluster", y = "Proportion", fill = "Maintenance Status") +
+  theme_minimal(base_size = 13)
+```
+
+## 11.6 Key Performance Metrics by Cluster
+
+```{r cluster-kpis, fig.height=8}
+kpi_long <- df_interp %>%
+  select(KMeans_Cluster,
+         Efficiency_nm_per_kWh, Operational_Cost_USD,
+         Revenue_per_Voyage_USD, Speed_Over_Ground_knots,
+         Average_Load_Percentage, Turnaround_Time_hours) %>%
+  pivot_longer(-KMeans_Cluster, names_to = "KPI", values_to = "Value")
+
+ggplot(kpi_long, aes(x = KMeans_Cluster, y = Value, fill = KMeans_Cluster)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21, outlier.size = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  facet_wrap(~ KPI, scales = "free_y", ncol = 3) +
+  labs(title = "Key Performance KPIs Across K-Means Clusters",
+       x = "Cluster", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+## 11.7 Cluster Archetype Naming
+
+```{r archetype-table, echo=FALSE}
+archetype_df <- data.frame(
+  Cluster = paste("Cluster", 1:chosen_k),
+  Provisional_Name = c(
+    "High-Efficiency Performers",
+    "Balanced Mid-Range Fleet",
+    "At-Risk Underperformers"
+  ),
+  Key_Signal = c(
+    "High Profit_Margin, high Efficiency_nm_per_kWh, low Cost_per_nm",
+    "Moderate across all 5 efficiency & financial ratios",
+    "Low margin, high Cost_per_nm, low Efficiency_nm_per_kWh"
+  ),
+  Action = c(
+    "Benchmark and replicate — optimal cost and fuel model",
+    "Monitor — identify levers to push toward Cluster 1",
+    "Priority for cost review and maintenance intervention"
+  )
+)
+
+kable(archetype_df, caption = "Provisional Cluster Archetypes — Focused 5-Feature Result") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = TRUE) %>%
+  column_spec(2, bold = TRUE) %>%
+  row_spec(3, background = "#fde8e8") %>%
+  row_spec(1, background = "#e8f8ee")
+```
+
+> **Note:** Provisional names above are based on expected cluster behaviour from the
+> EDA findings. Revise them after reading the actual cross-tab plots above, which
+> show the true composition of each cluster.
+
+---
+
+# 12. Cluster Stability Check
+
+## Agreement Between All Algorithms
+
+```{r agreement}
+# Adjusted Rand Index — measures pairwise agreement between clusterings
+ari_km_hc  <- round(adjustedRandIndex(km_result$cluster,          hc_labels), 4)
+ari_km_gmm <- round(adjustedRandIndex(km_result$cluster,          gmm_result$classification), 4)
+ari_km_pam <- round(adjustedRandIndex(km_result$cluster,          pam_result$clustering), 4)
+ari_hc_gmm <- round(adjustedRandIndex(hc_labels,                  gmm_result$classification), 4)
+ari_hc_pam <- round(adjustedRandIndex(hc_labels,                  pam_result$clustering), 4)
+ari_gmm_pam<- round(adjustedRandIndex(gmm_result$classification,  pam_result$clustering), 4)
+
+ari_df <- data.frame(
+  Pair        = c("K-Means vs Hierarchical", "K-Means vs GMM", "K-Means vs PAM",
+                  "Hierarchical vs GMM",      "Hierarchical vs PAM", "GMM vs PAM"),
+  ARI         = c(ari_km_hc, ari_km_gmm, ari_km_pam,
+                  ari_hc_gmm, ari_hc_pam, ari_gmm_pam),
+  Agreement   = case_when(
+    c(ari_km_hc, ari_km_gmm, ari_km_pam, ari_hc_gmm, ari_hc_pam, ari_gmm_pam) > 0.6 ~ "Strong",
+    c(ari_km_hc, ari_km_gmm, ari_km_pam, ari_hc_gmm, ari_hc_pam, ari_gmm_pam) > 0.3 ~ "Moderate",
+    TRUE ~ "Weak"
+  )
+)
+
+kable(ari_df, caption = "Adjusted Rand Index — Pairwise Algorithm Agreement") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  column_spec(2, bold = TRUE) %>%
+  column_spec(3, color = ifelse(ari_df$Agreement == "Strong", "darkgreen",
+                         ifelse(ari_df$Agreement == "Moderate", "darkorange", "red")),
+              bold = TRUE)
+```
+
+```{r agreement-plot}
+df_agreement <- data.frame(
+  KMeans = factor(km_result$cluster),
+  HC     = factor(hc_labels),
+  GMM    = factor(gmm_result$classification),
+  PAM    = factor(pam_result$clustering)
+)
+
+p_hc <- ggplot(df_agreement, aes(x = KMeans, fill = HC)) +
+  geom_bar(position = "fill", color = "white") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = paste("K-Means vs HC | ARI =", ari_km_hc),
+       x = "K-Means", y = "Proportion", fill = "HC") +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+
+p_gmm <- ggplot(df_agreement, aes(x = KMeans, fill = GMM)) +
+  geom_bar(position = "fill", color = "white") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = paste("K-Means vs GMM | ARI =", ari_km_gmm),
+       x = "K-Means", y = "Proportion", fill = "GMM") +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+
+p_pam <- ggplot(df_agreement, aes(x = KMeans, fill = PAM)) +
+  geom_bar(position = "fill", color = "white") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_brewer(palette = "Pastel2") +
+  labs(title = paste("K-Means vs PAM | ARI =", ari_km_pam),
+       x = "K-Means", y = "Proportion", fill = "PAM") +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+
+grid.arrange(p_hc, p_gmm, p_pam, ncol = 3,
+             top = "Pairwise Cluster Agreement vs K-Means")
+```
+
+---
+
+# 13. Final Summary
+
+```{r final-summary, echo=FALSE}
+best_algo <- c("K-Means", "Hierarchical (Ward.D2)", "DBSCAN",
+               "GMM (EM)", "PAM (K-Medoids)")[which.max(all_sil)]
+
+summary_df <- data.frame(
+  Step = c(
+    "Feature scaling",
+    "Categorical encoding",
+    "Optimal K selection",
+    "Algorithm 1 — K-Means",
+    "Algorithm 2 — Hierarchical (Ward.D2)",
+    "Algorithm 3 — DBSCAN",
+    "Algorithm 4 — GMM (EM)",
+    "Algorithm 5 — PAM (K-Medoids)",
+    "Best algorithm (by silhouette)",
+    "Cluster interpretation"
+  ),
+  Detail = c(
+    "Z-score standardisation (mean=0, SD=1) applied to all 14 features",
+    paste("One-hot encoding: Maintenance_Status (", paste(ohe_features[startsWith(ohe_features,"Maintenance")], collapse=", "), ") | Weather (", paste(ohe_features[startsWith(ohe_features,"Weather")], collapse=", "), ")"),
+    paste("K =", chosen_k, "selected via Elbow + Silhouette + Gap Statistic"),
+    paste("Avg silhouette:", km_avg_sil, "| Hard assignment | Spherical clusters"),
+    paste("Avg silhouette:", hc_avg_sil, "| Ward.D2 linkage | Dendrogram cut at K =", chosen_k),
+    paste("Avg silhouette: N/A | Clusters found:", n_db_clusters,
+          "| Noise:", sum(db_result$cluster == 0)),
+    paste("Avg silhouette:", gmm_avg_sil, "| Model:", gmm_result$modelName,
+          "| K selected by BIC:", gmm_result$G, "| Soft assignment"),
+    paste("Avg silhouette:", pam_avg_sil, "| Hard assignment | Medoid = real voyage | Outlier-robust"),
+    paste(best_algo, "— silhouette:", round(max(all_sil, na.rm=TRUE), 4)),
+    "Cross-tabs in Section 11 — name each archetype using Ship Type, Route, Engine, Maintenance"
+  )
+)
+
+kable(summary_df, caption = "Clustering Pipeline — 5-Algorithm Summary") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = TRUE) %>%
+  row_spec(which(summary_df$Step == "Best algorithm (by silhouette)"),
+           bold = TRUE, background = "#d5f5e3")
+```
+
+---
+
+*End of Clustering Report — next step: classifier on `Maintenance_Status`*

@@ -22,6 +22,7 @@ knitr::opts_chunk$set(
   fig.height = 6,
   fig.align  = "center"
 )
+dir.create("plots", showWarnings = FALSE)
 ```
 
 ---
@@ -259,6 +260,9 @@ ggplot(scree_df[1:min(20, nrow(scree_df)), ], aes(x = PC, y = Cum)) +
        x = "Principal Component", y = "Cumulative Variance (%)") +
   theme_minimal(base_size = 13)
 
+ggsave("plots/00a_preprocessing_pca_variance.png", plot = last_plot(),
+       width = 10, height = 5, dpi = 150)
+
 X_pca    <- as.matrix(pca_obj$x[, 1:n_comp])
 X_scaled <- X_pca
 cat("\nFull-pipeline feature matrix:", ncol(X_scaled), "principal components.\n")
@@ -332,6 +336,9 @@ ggplot(sil_scan_df, aes(x = K, y = Silhouette)) +
        x = "Number of Clusters (K)", y = "Average Silhouette Width") +
   theme_minimal(base_size = 13)
 
+ggsave("plots/00b_preprocessing_focused_silhouette_scan.png", plot = last_plot(),
+       width = 10, height = 5, dpi = 150)
+
 cat("\nSilhouette scores by K:\n")
 print(sil_scan_df)
 
@@ -356,6 +363,7 @@ fviz_nbclust(X_scaled, kmeans,
   labs(title = "Elbow Method — Within-Cluster Sum of Squares",
        subtitle = "Look for the 'elbow' where WSS stops dropping sharply") +
   theme_minimal(base_size = 13)
+ggsave("plots/01_k_selection_elbow.png", plot = last_plot(), width = 10, height = 5, dpi = 150)
 ```
 
 ## 4.2 Silhouette Score
@@ -373,6 +381,7 @@ fviz_nbclust(X_scaled, kmeans,
   labs(title = "Silhouette Method — Average Silhouette Width",
        subtitle = "Higher is better — K with peak score is optimal") +
   theme_minimal(base_size = 13)
+ggsave("plots/02_k_selection_silhouette.png", plot = last_plot(), width = 10, height = 5, dpi = 150)
 ```
 
 ## 4.3 Gap Statistic
@@ -385,6 +394,7 @@ fviz_gap_stat(gap_stat, linecolor = "#8e44ad") +
   labs(title = "Gap Statistic — Comparing Cluster Compactness to Null Reference",
        subtitle = "Optimal K = largest gap before it levels off") +
   theme_minimal(base_size = 13)
+ggsave("plots/03_k_selection_gap_statistic.png", plot = last_plot(), width = 10, height = 5, dpi = 150)
 ```
 
 ## 4.4 K Decision
@@ -434,6 +444,7 @@ fviz_cluster(km_result,
              ggtheme      = theme_minimal(base_size = 13)) +
   labs(title = "K-Means Clusters — PCA Projection (PC1 vs PC2)",
        subtitle = paste("K =", chosen_k, "| Coloured ellipses = cluster boundaries"))
+ggsave("plots/04_kmeans_pca_projection.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 ```
 
 ## 5.3 Silhouette Plot — K-Means Quality
@@ -444,6 +455,7 @@ km_sil <- silhouette(km_result$cluster, dist(X_scaled))
 fviz_silhouette(km_sil, palette = "Set2", ggtheme = theme_minimal(base_size = 12)) +
   labs(title = "Silhouette Plot — K-Means",
        subtitle = "Bars below 0 indicate misclassified points")
+ggsave("plots/05_kmeans_silhouette.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 
 cat("\nAverage silhouette width:", round(mean(km_sil[, 3]), 4), "\n")
 ```
@@ -485,6 +497,7 @@ ggplot(km_heat, aes(x = KMeans_Cluster, y = Feature, fill = Z_Score)) +
        x = "Cluster", y = "Feature") +
   theme_minimal(base_size = 12) +
   theme(axis.text.y = element_text(size = 10))
+ggsave("plots/06_kmeans_cluster_profile_heatmap.png", plot = last_plot(), width = 11, height = 7, dpi = 150)
 ```
 
 ---
@@ -528,6 +541,8 @@ abline(h = rev(hc_sample$height)[chosen_k], lty = 2, col = "#e74c3c", lwd = 2)
 legend("topright", legend = paste("Cluster", 1:chosen_k),
        fill = c("#1b9e77","#d95f02","#7570b3","#e7298a")[1:chosen_k],
        border = NA, bty = "n")
+dev.copy(png, "plots/07_hierarchical_dendrogram.png", width = 1800, height = 1050, res = 150)
+dev.off()
 ```
 
 ## 6.3 Cut Tree & Attach Labels
@@ -553,6 +568,7 @@ fviz_cluster(list(data = X_scaled, cluster = hc_labels),
              ggtheme      = theme_minimal(base_size = 13)) +
   labs(title = "Hierarchical Clusters (Ward.D2) — PCA Projection",
        subtitle = paste("K =", chosen_k, "cut from dendrogram"))
+ggsave("plots/08_hierarchical_pca_projection.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 ```
 
 ## 6.5 Silhouette — Hierarchical Quality
@@ -562,6 +578,7 @@ hc_sil <- silhouette(hc_labels, dist_mat)
 
 fviz_silhouette(hc_sil, palette = "Dark2", ggtheme = theme_minimal(base_size = 12)) +
   labs(title = "Silhouette Plot — Hierarchical Clustering (Ward.D2)")
+ggsave("plots/09_hierarchical_silhouette.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 
 cat("\nAverage silhouette width:", round(mean(hc_sil[, 3]), 4), "\n")
 ```
@@ -601,6 +618,8 @@ cat("Recommended minPts:", minPts_val, "\n")
 kNNdistplot(X_scaled, k = minPts_val)
 title(main = paste("k-NN Distance Plot (k =", minPts_val, ") — Find eps at Elbow"))
 abline(h = 5.5, lty = 2, col = "#e74c3c", lwd = 2)
+dev.copy(png, "plots/10_dbscan_knn_distance_eps_tuning.png", width = 1500, height = 750, res = 150)
+dev.off()
 ```
 
 ## 7.2 Fit DBSCAN
@@ -632,6 +651,7 @@ fviz_cluster(db_result,
   labs(title = "DBSCAN Clusters — PCA Projection",
        subtitle = paste("eps =", 5.5, "| minPts =", minPts_val,
                         "| Cluster 0 (grey) = noise"))
+ggsave("plots/11_dbscan_pca_projection.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 ```
 
 ## 7.4 DBSCAN Silhouette (Non-noise Points Only)
@@ -674,6 +694,8 @@ gmm_bic <- mclustBIC(X_scaled, G = 1:10, verbose = FALSE)
 plot(gmm_bic,
      main = "GMM — BIC by Number of Components and Covariance Model",
      legendArgs = list(x = "bottomright", cex = 0.7))
+dev.copy(png, "plots/12_gmm_bic_model_selection.png", width = 1500, height = 750, res = 150)
+dev.off()
 ```
 
 ```{r gmm-fit}
@@ -726,6 +748,7 @@ fviz_cluster(list(data = X_scaled, cluster = gmm_result$classification),
        subtitle = paste("K =", gmm_result$G,
                         "| Model:", gmm_result$modelName,
                         "| BIC:", round(gmm_result$bic, 1)))
+ggsave("plots/13_gmm_pca_projection.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 ```
 
 ## 8.4 Uncertainty Plot — Soft Membership
@@ -737,6 +760,8 @@ dense core have low uncertainty (darker colour).
 ```{r gmm-uncertainty, fig.height=5}
 plot(gmm_result, what = "uncertainty",
      main = "GMM Classification Uncertainty\n(Darker = more certain assignment)")
+dev.copy(png, "plots/14_gmm_uncertainty_plot.png", width = 1500, height = 750, res = 150)
+dev.off()
 ```
 
 ## 8.5 Silhouette — GMM Quality
@@ -746,6 +771,7 @@ gmm_sil <- silhouette(gmm_result$classification, dist(X_scaled))
 
 fviz_silhouette(gmm_sil, palette = "Set1", ggtheme = theme_minimal(base_size = 12)) +
   labs(title = "Silhouette Plot — GMM")
+ggsave("plots/15_gmm_silhouette.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 
 cat("\nAverage silhouette width:", round(mean(gmm_sil[, 3]), 4), "\n")
 ```
@@ -810,6 +836,7 @@ fviz_cluster(pam_result,
   labs(title = "PAM (K-Medoids) Clusters — PCA Projection",
        subtitle = paste("K =", chosen_k,
                         "| Stars = medoid points (real voyages)"))
+ggsave("plots/16_pam_pca_projection.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 ```
 
 ## 9.3 Silhouette Plot — PAM Quality
@@ -819,6 +846,7 @@ pam_sil <- silhouette(pam_result$clustering, dist(X_scaled))
 
 fviz_silhouette(pam_sil, palette = "Dark2", ggtheme = theme_minimal(base_size = 12)) +
   labs(title = "Silhouette Plot — PAM (K-Medoids)")
+ggsave("plots/17_pam_silhouette.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 
 cat("\nAverage silhouette width:", round(mean(pam_sil[, 3]), 4), "\n")
 ```
@@ -952,6 +980,7 @@ ggplot(ct_ship, aes(x = KMeans_Cluster, y = Pct, fill = Ship_Type)) +
   labs(title = "Cluster Composition by Ship Type",
        x = "K-Means Cluster", y = "Proportion", fill = "Ship Type") +
   theme_minimal(base_size = 13)
+ggsave("plots/18_interpretation_cluster_by_ship_type.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 ```
 
 ## 11.3 Cross-Tab: Cluster × Route Type
@@ -970,6 +999,7 @@ ggplot(ct_route, aes(x = KMeans_Cluster, y = Pct, fill = Route_Type)) +
   labs(title = "Cluster Composition by Route Type",
        x = "K-Means Cluster", y = "Proportion", fill = "Route Type") +
   theme_minimal(base_size = 13)
+ggsave("plots/19_interpretation_cluster_by_route.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 ```
 
 ## 11.4 Cross-Tab: Cluster × Engine Type
@@ -988,6 +1018,7 @@ ggplot(ct_engine, aes(x = KMeans_Cluster, y = Pct, fill = Engine_Type)) +
   labs(title = "Cluster Composition by Engine Type",
        x = "K-Means Cluster", y = "Proportion", fill = "Engine Type") +
   theme_minimal(base_size = 13)
+ggsave("plots/20_interpretation_cluster_by_engine.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 ```
 
 ## 11.5 Cross-Tab: Cluster × Maintenance Status
@@ -1007,6 +1038,7 @@ ggplot(ct_maint, aes(x = KMeans_Cluster, y = Pct, fill = Maintenance_Status)) +
   labs(title = "Cluster Composition by Maintenance Status",
        x = "K-Means Cluster", y = "Proportion", fill = "Maintenance Status") +
   theme_minimal(base_size = 13)
+ggsave("plots/21_interpretation_cluster_by_maintenance.png", plot = last_plot(), width = 11, height = 6, dpi = 150)
 ```
 
 ## 11.6 Key Performance Metrics by Cluster
@@ -1027,6 +1059,7 @@ ggplot(kpi_long, aes(x = KMeans_Cluster, y = Value, fill = KMeans_Cluster)) +
        x = "Cluster", y = NULL) +
   theme_minimal(base_size = 11) +
   theme(legend.position = "none")
+ggsave("plots/22_interpretation_kpi_boxplots.png", plot = last_plot(), width = 11, height = 8, dpi = 150)
 ```
 
 ## 11.7 Cluster Archetype Naming
@@ -1129,6 +1162,10 @@ p_pam <- ggplot(df_agreement, aes(x = KMeans, fill = PAM)) +
        x = "K-Means", y = "Proportion", fill = "PAM") +
   theme_minimal(base_size = 11) + theme(legend.position = "bottom")
 
+stability_grid <- arrangeGrob(p_hc, p_gmm, p_pam, ncol = 3,
+                               top = "Pairwise Cluster Agreement vs K-Means")
+ggsave("plots/23_stability_algorithm_agreement.png", plot = stability_grid,
+       width = 15, height = 6, dpi = 150)
 grid.arrange(p_hc, p_gmm, p_pam, ncol = 3,
              top = "Pairwise Cluster Agreement vs K-Means")
 ```
